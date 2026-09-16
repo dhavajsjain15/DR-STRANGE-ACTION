@@ -1,38 +1,41 @@
 import cv2
 import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 import numpy as np
 import math
 import time
 import random
+import os
 
-def is_palm_open(hand_landmarks, mp_hands):
-    wrist = hand_landmarks.landmark[mp_hands.HandLandmark.WRIST]
+def is_palm_open(hand_landmarks):
+    wrist = hand_landmarks[0]
     extended = 0
     tips = [8, 12, 16, 20]
     mcps = [5, 9, 13, 17]
     
     for tip, mcp in zip(tips, mcps):
-        d_tip_wrist = math.hypot(hand_landmarks.landmark[tip].x - wrist.x, hand_landmarks.landmark[tip].y - wrist.y)
-        d_mcp_wrist = math.hypot(hand_landmarks.landmark[mcp].x - wrist.x, hand_landmarks.landmark[mcp].y - wrist.y)
+        d_tip_wrist = math.hypot(hand_landmarks[tip].x - wrist.x, hand_landmarks[tip].y - wrist.y)
+        d_mcp_wrist = math.hypot(hand_landmarks[mcp].x - wrist.x, hand_landmarks[mcp].y - wrist.y)
         if d_tip_wrist > d_mcp_wrist * 1.3:
             extended += 1
             
-    thumb_tip = hand_landmarks.landmark[4]
-    thumb_ip = hand_landmarks.landmark[3]
+    thumb_tip = hand_landmarks[4]
+    thumb_ip = hand_landmarks[3]
     if abs(thumb_tip.x - thumb_ip.x) > 0.02 or abs(thumb_tip.y - thumb_ip.y) > 0.02:
         extended += 1
 
     return extended >= 4
 
-def is_fist(hand_landmarks, mp_hands):
-    wrist = hand_landmarks.landmark[mp_hands.HandLandmark.WRIST]
+def is_fist(hand_landmarks):
+    wrist = hand_landmarks[0]
     curled = 0
     tips = [8, 12, 16, 20]
     mcps = [5, 9, 13, 17]
     
     for tip, mcp in zip(tips, mcps):
-        d_tip_wrist = math.hypot(hand_landmarks.landmark[tip].x - wrist.x, hand_landmarks.landmark[tip].y - wrist.y)
-        d_mcp_wrist = math.hypot(hand_landmarks.landmark[mcp].x - wrist.x, hand_landmarks.landmark[mcp].y - wrist.y)
+        d_tip_wrist = math.hypot(hand_landmarks[tip].x - wrist.x, hand_landmarks[tip].y - wrist.y)
+        d_mcp_wrist = math.hypot(hand_landmarks[mcp].x - wrist.x, hand_landmarks[mcp].y - wrist.y)
         if d_tip_wrist < d_mcp_wrist * 1.1:
             curled += 1
             
@@ -40,16 +43,16 @@ def is_fist(hand_landmarks, mp_hands):
 
 
 def get_palm_center(hand_landmarks, w, h):
-    wrist = hand_landmarks.landmark[0]
-    middle_mcp = hand_landmarks.landmark[9]
+    wrist = hand_landmarks[0]
+    middle_mcp = hand_landmarks[9]
     cx = int((wrist.x + middle_mcp.x) / 2 * w)
     cy = int((wrist.y + middle_mcp.y) / 2 * h)
     return cx, cy
 
 
 def get_palm_size(hand_landmarks, w, h):
-    wrist = hand_landmarks.landmark[0]
-    middle_mcp = hand_landmarks.landmark[9]
+    wrist = hand_landmarks[0]
+    middle_mcp = hand_landmarks[9]
     dist = math.sqrt((wrist.x - middle_mcp.x)**2 * w**2 + (wrist.y - middle_mcp.y)**2 * h**2)
     return dist
 
@@ -226,37 +229,153 @@ def draw_magic_circle(frame, cx, cy, radius, t, intensity=1.0):
     cv2.circle(frame, (cx, cy), int(radius * 0.15), tuple(int(c * alpha * 0.5) for c in gold), -1, cv2.LINE_AA)
     cv2.circle(frame, (cx, cy), int(radius * 0.05 + 5 * pulse), tuple(int(c * alpha) for c in white_gold), -1, cv2.LINE_AA)
 
+class DoctorStrangeProcessor:
+    def __init__(self, model_path=None):
+        if model_path is None:
+            model_path = os.path.join(os.path.dirname(__file__), 'hand_landmarker.task')
+        
+        base_options = python.BaseOptions(model_asset_path=model_path)
+        options = vision.HandLandmarkerOptions(
+            base_options=base_options,
+            num_hands=2,
+            min_hand_detection_confidence=0.6,
+            min_hand_presence_confidence=0.6,
+            min_tracking_confidence=0.6
+        )
+        self.detector = vision.HandLandmarker.create_from_options(options)
+        self.portal_active = False
+        self.portal_center = (0, 0)
+        self.portal_radius = 0.0
+        self.portal_intensity_val = 0.0
+        self.drawing_points = []
+        self.spark_particles = []
+        self.portal_particles = []
+        self.start_time = time.time()
+        self.last_time = self.start_time
+
+    def process_frame(self, image):
+        now = time.time()
+        dt = now - self.last_time
+        self.last_time = now
+        t = now - self.start_time
+
+        image = cv2.flip(image, 1)
+        h, w, _ = image.shape
+
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
+        results = self.detector.detect(mp_image)
+
+        dark_bg = np.full((h, w, 3), (5, 3, 1), dtype=np.uint8)
+        blend = cv2.addWeighted(image, 0.55, dark_bg, 0.45, 0)
+
+        left_fist_present = False
+        right_hand_landmarks = None
+
+        if results.hand_landmarks and results.handedness:
+            for idx, hand_landmarks in enumerate(results.hand_landmarks):
+                label = results.handedness[idx][0].category_name
+                is_left_hand = (label == 'Right')
+                is_right_hand = (label == 'Left')
+
+                palm_open = is_palm_open(hand_landmarks)
+                fist = is_fist(hand_landmarks)
+
+                cx, cy = get_palm_center(hand_landmarks, w, h)
+                palm_size = get_palm_size(hand_landmarks, w, h)
+
+                if is_left_hand:
+                    if fist:
+                        left_fist_present = True
+                    elif palm_open and not self.portal_active and len(self.drawing_points) == 0:
+                        draw_magic_circle(blend, cx, cy, palm_size * 1.5, t, 0.8)
+
+                if is_right_hand:
+                    right_hand_landmarks = hand_landmarks
+                    if palm_open and not self.portal_active and len(self.drawing_points) == 0:
+                        draw_magic_circle(blend, cx, cy, palm_size * 1.5, t, 0.8)
+
+        if left_fist_present:
+            if not self.portal_active:
+                if right_hand_landmarks:
+                    index_tip = right_hand_landmarks[8]
+                    ix, iy = int(index_tip.x * w), int(index_tip.y * h)
+                    self.drawing_points.append((ix, iy))
+                    
+                    for _ in range(4):
+                        self.spark_particles.append(Spark(ix, iy))
+                        
+                    if len(self.drawing_points) > 100:
+                        self.drawing_points.pop(0)
+                        
+                    is_circle, center, avg_radius = check_circle_gesture(self.drawing_points, min_perimeter=250, close_threshold=50)
+                    if is_circle:
+                        self.portal_active = True
+                        self.portal_center = center
+                        self.portal_radius = max(avg_radius, 120) * 1.2
+                        self.drawing_points = []
+            else:
+                self.portal_intensity_val = min(1.0, self.portal_intensity_val + dt * 2.0)
+                self.drawing_points = []
+        else:
+            self.portal_intensity_val = max(0.0, self.portal_intensity_val - dt * 2.0)
+            if self.portal_intensity_val <= 0:
+                self.portal_active = False
+            self.drawing_points = []
+
+        if len(self.drawing_points) > 1:
+            for i in range(1, len(self.drawing_points)):
+                cv2.line(blend, self.drawing_points[i-1], self.drawing_points[i], (50, 180, 255), 2, cv2.LINE_AA)
+
+        if self.portal_active or self.portal_intensity_val > 0.05:
+            draw_magic_circle(blend, int(self.portal_center[0]), int(self.portal_center[1]), self.portal_radius, t, self.portal_intensity_val)
+            if random.random() < 0.8 * self.portal_intensity_val:
+                for _ in range(2):
+                    self.portal_particles.append(Particle(self.portal_center[0], self.portal_center[1], self.portal_radius))
+                
+        alive_sparks = []
+        for p in self.spark_particles:
+            if p.update(dt):
+                p.draw(blend)
+                alive_sparks.append(p)
+        self.spark_particles = alive_sparks
+
+        alive_portal = []
+        for p in self.portal_particles:
+            if p.update(dt):
+                p.draw(blend)
+                alive_portal.append(p)
+        self.portal_particles = alive_portal
+
+        if len(self.spark_particles) > 300:
+            self.spark_particles = self.spark_particles[-200:]
+        if len(self.portal_particles) > 400:
+            self.portal_particles = self.portal_particles[-300:]
+
+        return blend
+
 def main():
-    mp_hands = mp.solutions.hands
-    mp_drawing = mp.solutions.drawing_utils
+    processor = DoctorStrangeProcessor()
 
-    hands = mp_hands.Hands(
-        max_num_hands=2,
-        model_complexity=1,
-        min_detection_confidence=0.6,
-        min_tracking_confidence=0.6
-    )
+    cap = None
+    for cam_idx in [0, 1, 2]:
+        cap = cv2.VideoCapture(cam_idx)
+        if cap.isOpened():
+            print(f"[INFO] Successfully opened camera index {cam_idx}")
+            break
+        cap.release()
 
-    cap = cv2.VideoCapture(1)
+    if cap is None or not cap.isOpened():
+        print("[ERROR] Cannot open any camera (tried indices 0, 1, 2).")
+        return
+
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-    portal_active = False
-    portal_center = (0, 0)
-    portal_radius = 0.0
-    portal_intensity_val = 0.0
-
-    drawing_points = []
-    spark_particles = [] 
-    portal_particles = []
-
-    start_time = time.time()
-    last_time = start_time
-
     print("╔════════════════════════════════════════════════╗")
-    print("║        Doctor Strange Portal Effect 🌀         ║")
+    print("║        Doctor Strange Portal Effect *          ║")
     print("╠════════════════════════════════════════════════╣")
-    print("║  1. Open Palm -> Small Magical Hand Runes      ║")
+    print("║  1. Open Palm -> Magical Hand Runes            ║")
     print("║  2. Left Fist + Right Hand Circles -> PORTAL   ║")
     print("║  Press 'q' / ESC to Quit                       ║")
     print("╚════════════════════════════════════════════════╝")
@@ -266,104 +385,7 @@ def main():
         if not success:
             break
 
-        now = time.time()
-        dt = now - last_time
-        last_time = now
-        t = now - start_time
-
-        image = cv2.flip(image, 1)
-        h, w, _ = image.shape
-
-        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        results = hands.process(image_rgb)
-
-        dark_bg = np.full((h, w, 3), (5, 3, 1), dtype=np.uint8)
-        blend = cv2.addWeighted(image, 0.55, dark_bg, 0.45, 0)
-
-        left_fist_present = False
-        right_hand_landmarks = None
-
-        if results.multi_hand_landmarks and len(results.multi_handedness) == len(results.multi_hand_landmarks):
-            for idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
-
-                label = results.multi_handedness[idx].classification[0].label
-                is_left_hand = (label == 'Right')
-                is_right_hand = (label == 'Left')
-
-                palm_open = is_palm_open(hand_landmarks, mp_hands)
-                fist = is_fist(hand_landmarks, mp_hands)
-
-                cx, cy = get_palm_center(hand_landmarks, w, h)
-                palm_size = get_palm_size(hand_landmarks, w, h)
-
-                if is_left_hand:
-                    if fist:
-                        left_fist_present = True
-                    elif palm_open and not portal_active and len(drawing_points) == 0:
-                        draw_magic_circle(blend, cx, cy, palm_size * 1.5, t, 0.8)
-                
-                if is_right_hand:
-                    right_hand_landmarks = hand_landmarks
-                    if palm_open and not portal_active and len(drawing_points) == 0:
-                        draw_magic_circle(blend, cx, cy, palm_size * 1.5, t, 0.8)
-
-        if left_fist_present:
-            if not portal_active:
-                if right_hand_landmarks:
-                    index_tip = right_hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
-                    ix, iy = int(index_tip.x * w), int(index_tip.y * h)
-                    drawing_points.append((ix, iy))
-                    
-                    for _ in range(4):
-                        spark_particles.append(Spark(ix, iy))
-                        
-                    if len(drawing_points) > 100:
-                        drawing_points.pop(0)
-                        
-                    is_circle, center, avg_radius = check_circle_gesture(drawing_points, min_perimeter=250, close_threshold=50)
-                    if is_circle:
-                        portal_active = True
-                        portal_center = center
-                        portal_radius = max(avg_radius, 120) * 1.2
-                        drawing_points = []
-            else:
-                portal_intensity_val = min(1.0, portal_intensity_val + dt * 2.0)
-                drawing_points = []
-        else:
-            portal_intensity_val = max(0.0, portal_intensity_val - dt * 2.0)
-            if portal_intensity_val <= 0:
-                portal_active = False
-            drawing_points = []
-
-        if len(drawing_points) > 1:
-            for i in range(1, len(drawing_points)):
-                cv2.line(blend, drawing_points[i-1], drawing_points[i], (50, 180, 255), 2, cv2.LINE_AA)
-
-        if portal_active or portal_intensity_val > 0.05:
-            draw_magic_circle(blend, int(portal_center[0]), int(portal_center[1]), portal_radius, t, portal_intensity_val)
-            if random.random() < 0.8 * portal_intensity_val:
-                for _ in range(2):
-                    portal_particles.append(Particle(portal_center[0], portal_center[1], portal_radius))
-                
-        alive_sparks = []
-        for p in spark_particles:
-            if p.update(dt):
-                p.draw(blend)
-                alive_sparks.append(p)
-        spark_particles = alive_sparks
-
-        alive_portal = []
-        for p in portal_particles:
-            if p.update(dt):
-                p.draw(blend)
-                alive_portal.append(p)
-        portal_particles = alive_portal
-
-        if len(spark_particles) > 300:
-            spark_particles = spark_particles[-200:]
-        if len(portal_particles) > 400:
-            portal_particles = portal_particles[-300:]
-
+        blend = processor.process_frame(image)
         cv2.imshow('Doctor Strange Portal', blend)
 
         key = cv2.waitKey(1) & 0xFF
